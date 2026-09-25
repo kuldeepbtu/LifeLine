@@ -269,14 +269,14 @@ This prevents public signup from creating privileged operational users. A driver
 
 ### Local Development Users
 
-For local development, set `LIFELINE_DEMO_PASSWORD` and use the seeded accounts below. These users are a development convenience only; the product model is signup plus approval for operational roles.
+For local development, set `LIFELINE_DEMO_PASSWORD` (e.g., `123` or your chosen password) and use the seeded accounts below:
 
-| Username | Role | Scope |
-| --- | --- | --- |
-| `patient.demo` | `PATIENT` | Own seeded and newly requested incidents |
-| `driver.demo` | `DRIVER` | Ambulance `AMB-101` and assigned trips |
-| `hospital.demo` | `HOSPITAL` | Hospital `HOS-201` and incoming trips |
-| `control.demo` | `CONTROL` | Full operational access |
+| Role | Username | Password | Scope / Details |
+| --- | --- | --- | --- |
+| **Control Dashboard (Full access)** | `control.demo` | `123` *(or your set demo password)* | Full operational & citywide control |
+| **Driver (Ambulance AMB-101)** | `driver.demo` | `123` *(or your set demo password)* | Ambulance `AMB-101` and assigned trips |
+| **Hospital (Hospital HOS-201)** | `hospital.demo` | `123` *(or your set demo password)* | Hospital `HOS-201` and incoming trips |
+| **Patient (Create request)** | `patient.demo` | `123` *(or your set demo password)* | Own seeded and newly requested incidents |
 
 JWT claims include `sub`, `role`, optional `ambulanceId`, optional `hospitalId`, `iat`, and `exp`.
 
@@ -438,6 +438,15 @@ npm run dev
 ```
 
 Open `http://localhost:5173`.
+
+### Demo Login Accounts
+
+| Role | Username | Password |
+| :--- | :--- | :--- |
+| **Control Dashboard (Full access)** | `control.demo` | `123` *(or your set demo password)* |
+| **Driver (Ambulance AMB-101)** | `driver.demo` | `123` *(or your set demo password)* |
+| **Hospital (Hospital HOS-201)** | `hospital.demo` | `123` *(or your set demo password)* |
+| **Patient (Create request)** | `patient.demo` | `123` *(or your set demo password)* |
 
 ### Memory Profile
 
