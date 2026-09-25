@@ -1,0 +1,54 @@
+spring:
+  application:
+    name: lifeline-backend
+  datasource:
+    url: ${LIFELINE_DB_URL:jdbc:postgresql://localhost:5432/lifeline}
+    username: ${LIFELINE_DB_USERNAME:lifeline}
+    password: ${LIFELINE_DB_PASSWORD:lifeline}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${LIFELINE_REDIS_HOST:localhost}
+      port: ${LIFELINE_REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${LIFELINE_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+lifeline:
+  cors:
+    allowed-origins: ${LIFELINE_ALLOWED_ORIGINS:http://localhost:5173}
+  security:
+    jwt-secret: ${LIFELINE_JWT_SECRET}
+    demo-password: ${LIFELINE_DEMO_PASSWORD}
+    token-ttl-minutes: 480
+  dispatch:
+    average-ambulance-speed-kmph: 32
+    average-transfer-speed-kmph: 28
+  live-location:
+    ttl-seconds: 180
+  kafka:
+    outbox-topic: lifeline.outbox.events
+    publish-timeout-seconds: 5
+  outbox:
+    publish:
+      enabled: false
+      batch-size: 25
+      fixed-delay-ms: 5000
+      retry-delay-seconds: 30
+    publisher:
+      mode: kafka
+      fail-event-type: ""
+      failure-message: Configured outbox publisher failure

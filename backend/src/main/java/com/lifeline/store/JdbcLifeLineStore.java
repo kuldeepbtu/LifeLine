@@ -1,0 +1,1296 @@
+package com.lifeline.store;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.lifeline.dispatch.CandidateScore;
+import com.lifeline.domain.Ambulance;
+import com.lifeline.domain.AmbulanceStatus;
+import com.lifeline.domain.AmbulanceType;
+import com.lifeline.domain.DispatchAuditRecord;
+import com.lifeline.domain.EmergencyCondition;
+import com.lifeline.domain.Hospital;
+import com.lifeline.domain.HospitalApplication;
+import com.lifeline.domain.HospitalApplicationStatus;
+import com.lifeline.domain.Incident;
+import com.lifeline.domain.IncidentPriority;
+import com.lifeline.domain.IncidentStatus;
+import com.lifeline.domain.Location;
+import com.lifeline.domain.Notification;
+import com.lifeline.domain.NotificationRole;
+import com.lifeline.domain.OutboxEvent;
+import com.lifeline.domain.SecurityAuditEvent;
+import com.lifeline.domain.Trip;
+import com.lifeline.domain.TripStatus;
+import com.lifeline.simulation.OptimizationStrategy;
+import com.lifeline.simulation.SimulationAssignment;
+import com.lifeline.simulation.SimulationRequest;
+import com.lifeline.simulation.SimulationResult;
+import com.lifeline.simulation.SimulationStrategyResult;
+import org.springframework.context.annotation.Profile;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+@Repository
+@Profile("!memory")
+public class JdbcLifeLineStore implements LifeLineStore {
+    private final JdbcTemplate jdbc;
+    private final ObjectMapper objectMapper;
+
+    public JdbcLifeLineStore(JdbcTemplate jdbc, ObjectMapper objectMapper) {
+        this.jdbc = jdbc;
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public List<Ambulance> ambulances() {
+        return jdbc.query("""
+                SELECT id, call_sign, type, status, latitude, longitude, base_station
+                FROM ambulances
+                ORDER BY id
+                """, ambulanceMapper());
+    }
+
+    @Override
+    public List<Hospital> hospitals() {
+        Map<String, Set<EmergencyCondition>> specialties = allHospitalSpecialties();
+        return jdbc.query("""
+                SELECT id, name, latitude, longitude, total_beds, available_beds, quality_score
+                FROM hospitals
+                ORDER BY id
+                """, hospitalMapper(specialties));
+    }
+
+    @Override
+    public List<HospitalApplication> hospitalApplications() {
+        return jdbc.query("""
+                SELECT id, hospital_name, contact_name, contact_phone, address_text, latitude, longitude,
+                       specialties, total_beds, status, created_at, reviewed_at
+                FROM hospital_applications
+                ORDER BY created_at DESC
+                """, hospitalApplicationMapper());
+    }
+
+    @Override
+    public List<Incident> incidents() {
+        return jdbc.query("""
+                SELECT id, requester_user_id, patient_name, phone, condition, priority, latitude, longitude,
+                       address_text, landmark, location_source, created_at, status
+                FROM incidents
+                ORDER BY created_at DESC
+                """, incidentMapper());
+    }
+
+    @Override
+    public List<Trip> trips() {
+        return jdbc.query("""
+                SELECT id, incident_id, ambulance_id, hospital_id, pickup_eta_minutes,
+                       hospital_eta_minutes, total_cost, created_at, status
+                FROM trips
+                ORDER BY created_at DESC
+                """, tripMapper());
+    }
+
+    @Override
+    public List<DispatchAuditRecord> dispatchDecisions() {
+        return jdbc.query("""
+                SELECT id, incident_id, ambulance_id, hospital_id, pickup_eta_minutes,
+                       hospital_eta_minutes, hospital_load, quality_penalty, type_penalty,
+                       total_cost, explanation, created_at
+                FROM dispatch_decisions
+                ORDER BY created_at DESC
+                """, dispatchAuditMapper());
+    }
+
+    @Override
+    public List<OutboxEvent> outboxEvents() {
+        return jdbc.query("""
+                SELECT id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at,
+                       publish_attempts, last_publish_attempt_at, last_publish_error, next_publish_attempt_at
+                FROM outbox_events
+                ORDER BY created_at DESC
+                """, outboxEventMapper());
+    }
+
+    @Override
+    public List<Notification> notifications(NotificationRole role) {
+        return jdbc.query("""
+                SELECT id, role, title, message, event_id, event_type, created_at, acknowledged_at
+                FROM notifications
+                WHERE role = ?
+                ORDER BY created_at DESC
+                """, notificationMapper(), role.name());
+    }
+
+    @Override
+    public List<SimulationResult> simulations() {
+        return jdbc.query("""
+                SELECT id, request, created_at
+                FROM simulation_runs
+                ORDER BY created_at DESC
+                """, (rs, rowNum) -> simulationResult(
+                rs.getString("id"),
+                rs.getString("request"),
+                instant(rs, "created_at")
+        ));
+    }
+
+    @Override
+    public List<SecurityAuditEvent> securityAuditEvents(int limit) {
+        return jdbc.query("""
+                SELECT id, actor_user_id, actor_role, action, resource_type, resource_id,
+                       outcome, reason, metadata::text AS metadata, created_at
+                FROM security_audit_events
+                ORDER BY created_at DESC
+                LIMIT ?
+                """, securityAuditEventMapper(), limit);
+    }
+
+    @Override
+    public List<OutboxEvent> pendingOutboxEvents(int limit) {
+        return jdbc.query("""
+                SELECT id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at,
+                       publish_attempts, last_publish_attempt_at, last_publish_error, next_publish_attempt_at
+                FROM outbox_events
+                WHERE published_at IS NULL
+                ORDER BY created_at
+                LIMIT ?
+                """, outboxEventMapper(), limit);
+    }
+
+    @Override
+    @Transactional
+    public List<OutboxEvent> claimReadyOutboxEvents(int limit, Instant claimedAt, Instant nextAttemptAt) {
+        return jdbc.query("""
+                WITH ready_events AS (
+                    SELECT id
+                    FROM outbox_events
+                    WHERE published_at IS NULL
+                      AND (next_publish_attempt_at IS NULL OR next_publish_attempt_at <= ?)
+                    ORDER BY created_at
+                    LIMIT ?
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE outbox_events event
+                SET publish_attempts = event.publish_attempts + 1,
+                    last_publish_attempt_at = ?,
+                    next_publish_attempt_at = ?
+                FROM ready_events
+                WHERE event.id = ready_events.id
+                RETURNING event.id, event.aggregate_type, event.aggregate_id, event.event_type, event.payload,
+                          event.created_at, event.published_at, event.publish_attempts,
+                          event.last_publish_attempt_at, event.last_publish_error, event.next_publish_attempt_at
+                """,
+                outboxEventMapper(),
+                Timestamp.from(claimedAt),
+                limit,
+                Timestamp.from(claimedAt),
+                Timestamp.from(nextAttemptAt)
+        );
+    }
+
+    @Override
+    public int pendingOutboxEventCount() {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM outbox_events
+                WHERE published_at IS NULL
+                """, Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    @Override
+    public int notificationBacklog() {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM notifications
+                WHERE acknowledged_at IS NULL
+                """, Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    @Override
+    public Optional<Incident> findIncident(String id) {
+        return queryOptional("""
+                SELECT id, requester_user_id, patient_name, phone, condition, priority, latitude, longitude,
+                       address_text, landmark, location_source, created_at, status
+                FROM incidents
+                WHERE id = ?
+                """, incidentMapper(), id);
+    }
+
+    @Override
+    public Optional<Ambulance> findAmbulance(String id) {
+        return queryOptional("""
+                SELECT id, call_sign, type, status, latitude, longitude, base_station
+                FROM ambulances
+                WHERE id = ?
+                """, ambulanceMapper(), id);
+    }
+
+    @Override
+    public Optional<Hospital> findHospital(String id) {
+        Map<String, Set<EmergencyCondition>> specialties = Map.of(id, hospitalSpecialties(id));
+        return queryOptional("""
+                SELECT id, name, latitude, longitude, total_beds, available_beds, quality_score
+                FROM hospitals
+                WHERE id = ?
+                """, hospitalMapper(specialties), id);
+    }
+
+    @Override
+    public Optional<Trip> findTrip(String id) {
+        return queryOptional("""
+                SELECT id, incident_id, ambulance_id, hospital_id, pickup_eta_minutes,
+                       hospital_eta_minutes, total_cost, created_at, status
+                FROM trips
+                WHERE id = ?
+                """, tripMapper(), id);
+    }
+
+    @Override
+    public Optional<SimulationResult> findSimulation(String id) {
+        return queryOptional("""
+                SELECT id, request, created_at
+                FROM simulation_runs
+                WHERE id = ?
+                """, (rs, rowNum) -> simulationResult(
+                rs.getString("id"),
+                rs.getString("request"),
+                instant(rs, "created_at")
+        ), id);
+    }
+
+    @Override
+    @Transactional
+    public Incident createIncident(
+            String requesterUserId,
+            String patientName,
+            String phone,
+            EmergencyCondition condition,
+            IncidentPriority priority,
+            Location location,
+            String addressText,
+            String landmark,
+            String locationSource
+    ) {
+        String id = newId("INC");
+        Instant now = Instant.now();
+
+        jdbc.update("""
+                INSERT INTO incidents (id, requester_user_id, patient_name, phone, condition, priority, latitude, longitude,
+                                       address_text, landmark, location_source, created_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                id,
+                requesterUserId,
+                patientName,
+                phone,
+                condition.name(),
+                priority.name(),
+                location.latitude(),
+                location.longitude(),
+                addressText,
+                landmark == null ? "" : landmark,
+                locationSource == null ? "MANUAL" : locationSource,
+                Timestamp.from(now),
+                IncidentStatus.NEW.name()
+        );
+
+        appendOutbox("Incident", id, "incident.created", Map.of(
+                "incidentId", id,
+                "condition", condition.name(),
+                "priority", priority.name()
+        ), now);
+
+        return findIncident(id).orElseThrow();
+    }
+
+    @Override
+    @Transactional
+    public HospitalApplication createHospitalApplication(
+            String hospitalName,
+            String contactName,
+            String contactPhone,
+            String addressText,
+            Location location,
+            Set<EmergencyCondition> specialties,
+            int totalBeds
+    ) {
+        String id = newId("HAPP");
+        Instant now = Instant.now();
+        jdbc.update("""
+                INSERT INTO hospital_applications (id, hospital_name, contact_name, contact_phone, address_text,
+                                                  latitude, longitude, specialties, total_beds, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                id,
+                hospitalName,
+                contactName,
+                contactPhone,
+                addressText,
+                location.latitude(),
+                location.longitude(),
+                specialties.stream().map(Enum::name).sorted().collect(Collectors.joining(",")),
+                totalBeds,
+                HospitalApplicationStatus.PENDING.name(),
+                Timestamp.from(now)
+        );
+        appendOutbox("HospitalApplication", id, "hospital.application.submitted", Map.of(
+                "applicationId", id,
+                "hospitalName", hospitalName
+        ), now);
+        return hospitalApplications().stream()
+                .filter(application -> application.id().equals(id))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    @Override
+    @Transactional
+    public HospitalApplication approveHospitalApplication(String applicationId) {
+        HospitalApplication application = queryOptional("""
+                SELECT id, hospital_name, contact_name, contact_phone, address_text, latitude, longitude,
+                       specialties, total_beds, status, created_at, reviewed_at
+                FROM hospital_applications
+                WHERE id = ?
+                FOR UPDATE
+                """, hospitalApplicationMapper(), applicationId)
+                .orElseThrow(() -> new IllegalStateException("Hospital application not found."));
+        if (application.status() != HospitalApplicationStatus.PENDING) {
+            throw new IllegalStateException("Hospital application is already reviewed.");
+        }
+        String hospitalId = newId("HOS");
+        insertHospital(new Hospital(
+                hospitalId,
+                application.hospitalName(),
+                application.location(),
+                application.specialties(),
+                application.totalBeds(),
+                application.totalBeds(),
+                0.82
+        ));
+        Instant now = Instant.now();
+        jdbc.update("""
+                UPDATE hospital_applications
+                SET status = ?, reviewed_at = ?
+                WHERE id = ?
+                """, HospitalApplicationStatus.APPROVED.name(), Timestamp.from(now), applicationId);
+        appendOutbox("HospitalApplication", applicationId, "hospital.application.approved", Map.of(
+                "applicationId", applicationId,
+                "hospitalId", hospitalId
+        ), now);
+        return queryOptional("""
+                SELECT id, hospital_name, contact_name, contact_phone, address_text, latitude, longitude,
+                       specialties, total_beds, status, created_at, reviewed_at
+                FROM hospital_applications
+                WHERE id = ?
+                """, hospitalApplicationMapper(), applicationId).orElseThrow();
+    }
+
+    @Override
+    @Transactional
+    public Trip commitAssignment(
+            String incidentId,
+            String ambulanceId,
+            String hospitalId,
+            CandidateScore winningScore,
+            List<CandidateScore> alternatives
+    ) {
+        Incident incident = lockIncident(incidentId)
+                .orElseThrow(() -> new IllegalStateException("Cannot reserve missing incident."));
+        Ambulance ambulance = lockAmbulance(ambulanceId)
+                .orElseThrow(() -> new IllegalStateException("Cannot reserve missing ambulance."));
+        Hospital hospital = lockHospital(hospitalId)
+                .orElseThrow(() -> new IllegalStateException("Cannot reserve missing hospital."));
+
+        if (incident.status() != IncidentStatus.NEW) {
+            throw new IllegalStateException("Incident is no longer dispatchable.");
+        }
+        if (ambulance.status() != AmbulanceStatus.AVAILABLE) {
+            throw new IllegalStateException("Ambulance is no longer available.");
+        }
+        if (!ambulance.type().canHandle(requiredAmbulanceType(incident.condition(), incident.priority()))) {
+            throw new IllegalStateException("Ambulance capability no longer satisfies the incident.");
+        }
+        if (!hospital.canTreat(incident.condition())) {
+            throw new IllegalStateException("Hospital can no longer treat this condition.");
+        }
+        if (!hospital.hasCapacity()) {
+            throw new IllegalStateException("Hospital no longer has available beds.");
+        }
+
+        Instant now = Instant.now();
+        String tripId = newId("TRIP");
+        String decisionId = newId("DEC");
+
+        jdbc.update("""
+                UPDATE ambulances
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """, AmbulanceStatus.RESERVED.name(), Timestamp.from(now), ambulanceId);
+
+        jdbc.update("""
+                UPDATE hospitals
+                SET available_beds = available_beds - 1, updated_at = ?
+                WHERE id = ? AND available_beds > 0
+                """, Timestamp.from(now), hospitalId);
+
+        jdbc.update("""
+                UPDATE incidents
+                SET status = ?
+                WHERE id = ?
+                """, IncidentStatus.ASSIGNED.name(), incidentId);
+
+        jdbc.update("""
+                INSERT INTO trips (id, incident_id, ambulance_id, hospital_id, pickup_eta_minutes,
+                                   hospital_eta_minutes, total_cost, created_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tripId,
+                incidentId,
+                ambulanceId,
+                hospitalId,
+                winningScore.pickupEtaMinutes(),
+                winningScore.hospitalEtaMinutes(),
+                winningScore.totalCost(),
+                Timestamp.from(now),
+                TripStatus.RESERVED.name()
+        );
+
+        jdbc.update("""
+                INSERT INTO dispatch_decisions (id, incident_id, ambulance_id, hospital_id, pickup_eta_minutes,
+                                                hospital_eta_minutes, hospital_load, quality_penalty,
+                                                type_penalty, total_cost, explanation, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                decisionId,
+                incidentId,
+                ambulanceId,
+                hospitalId,
+                winningScore.pickupEtaMinutes(),
+                winningScore.hospitalEtaMinutes(),
+                winningScore.hospitalLoad(),
+                winningScore.qualityPenalty(),
+                winningScore.typePenalty(),
+                winningScore.totalCost(),
+                winningScore.explanation(),
+                Timestamp.from(now)
+        );
+
+        insertCandidateScores(decisionId, alternatives);
+
+        appendOutbox("Dispatch", tripId, "dispatch.reserved", Map.of(
+                "tripId", tripId,
+                "incidentId", incidentId,
+                "ambulanceId", ambulanceId,
+                "hospitalId", hospitalId,
+                "decisionId", decisionId,
+                "totalCost", winningScore.totalCost()
+        ), now);
+
+        return new Trip(
+                tripId,
+                incidentId,
+                ambulanceId,
+                hospitalId,
+                winningScore.pickupEtaMinutes(),
+                winningScore.hospitalEtaMinutes(),
+                winningScore.totalCost(),
+                now,
+                TripStatus.RESERVED
+        );
+    }
+
+    @Override
+    @Transactional
+    public Trip updateTripStatus(String tripId, TripStatus status) {
+        Trip trip = lockTrip(tripId)
+                .orElseThrow(() -> new IllegalStateException("Trip not found."));
+
+        Instant now = Instant.now();
+        jdbc.update("""
+                UPDATE trips
+                SET status = ?
+                WHERE id = ?
+                """, status.name(), tripId);
+
+        AmbulanceStatus ambulanceStatus = switch (status) {
+            case RESERVED -> AmbulanceStatus.RESERVED;
+            case EN_ROUTE_PATIENT, EN_ROUTE_HOSPITAL -> AmbulanceStatus.ON_TRIP;
+            case COMPLETED, CANCELLED -> AmbulanceStatus.AVAILABLE;
+        };
+
+        jdbc.update("""
+                UPDATE ambulances
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """, ambulanceStatus.name(), Timestamp.from(now), trip.ambulanceId());
+
+        if (status == TripStatus.COMPLETED) {
+            jdbc.update("""
+                    UPDATE incidents
+                    SET status = ?
+                    WHERE id = ?
+                    """, IncidentStatus.COMPLETED.name(), trip.incidentId());
+        } else if (status == TripStatus.CANCELLED) {
+            jdbc.update("""
+                    UPDATE incidents
+                    SET status = ?
+                    WHERE id = ?
+                    """, IncidentStatus.CANCELLED.name(), trip.incidentId());
+            jdbc.update("""
+                    UPDATE hospitals
+                    SET available_beds = LEAST(total_beds, available_beds + 1), updated_at = ?
+                    WHERE id = ?
+                    """, Timestamp.from(now), trip.hospitalId());
+        }
+
+        appendOutbox("Trip", tripId, "trip.status_changed", Map.of(
+                "tripId", tripId,
+                "status", status.name()
+        ), now);
+
+        return findTrip(tripId).orElseThrow();
+    }
+
+    @Override
+    @Transactional
+    public Hospital updateHospitalCapacity(String hospitalId, int availableBeds) {
+        Hospital hospital = lockHospital(hospitalId)
+                .orElseThrow(() -> new IllegalStateException("Hospital not found."));
+        if (availableBeds < 0 || availableBeds > hospital.totalBeds()) {
+            throw new IllegalStateException("Available beds must be between 0 and total beds.");
+        }
+
+        Instant now = Instant.now();
+        jdbc.update("""
+                UPDATE hospitals
+                SET available_beds = ?, updated_at = ?
+                WHERE id = ?
+                """, availableBeds, Timestamp.from(now), hospitalId);
+
+        appendOutbox("Hospital", hospitalId, "hospital.capacity_changed", Map.of(
+                "hospitalId", hospitalId,
+                "availableBeds", availableBeds
+        ), now);
+
+        return findHospital(hospitalId).orElseThrow();
+    }
+
+    @Override
+    @Transactional
+    public Trip rerouteTrip(
+            String tripId,
+            String hospitalId,
+            CandidateScore winningScore,
+            List<CandidateScore> alternatives
+    ) {
+        Trip trip = lockTrip(tripId)
+                .orElseThrow(() -> new IllegalStateException("Trip not found."));
+        Incident incident = lockIncident(trip.incidentId())
+                .orElseThrow(() -> new IllegalStateException("Incident not found."));
+        Ambulance ambulance = lockAmbulance(trip.ambulanceId())
+                .orElseThrow(() -> new IllegalStateException("Ambulance not found."));
+        Hospital hospital = lockHospital(hospitalId)
+                .orElseThrow(() -> new IllegalStateException("Target hospital not found."));
+
+        if (trip.status() == TripStatus.COMPLETED || trip.status() == TripStatus.CANCELLED) {
+            throw new IllegalStateException("Completed or cancelled trips cannot be rerouted.");
+        }
+        if (trip.hospitalId().equals(hospitalId)) {
+            throw new IllegalStateException("Trip is already assigned to this hospital.");
+        }
+        if (!ambulance.type().canHandle(requiredAmbulanceType(incident.condition(), incident.priority()))) {
+            throw new IllegalStateException("Ambulance capability no longer satisfies the incident.");
+        }
+        if (!hospital.canTreat(incident.condition())) {
+            throw new IllegalStateException("Target hospital cannot treat this condition.");
+        }
+        if (!hospital.hasCapacity()) {
+            throw new IllegalStateException("Target hospital has no capacity.");
+        }
+
+        Instant now = Instant.now();
+        String decisionId = newId("DEC");
+
+        jdbc.update("""
+                UPDATE hospitals
+                SET available_beds = available_beds - 1, updated_at = ?
+                WHERE id = ? AND available_beds > 0
+                """, Timestamp.from(now), hospitalId);
+
+        jdbc.update("""
+                UPDATE trips
+                SET hospital_id = ?, pickup_eta_minutes = ?, hospital_eta_minutes = ?, total_cost = ?
+                WHERE id = ?
+                """,
+                hospitalId,
+                winningScore.pickupEtaMinutes(),
+                winningScore.hospitalEtaMinutes(),
+                winningScore.totalCost(),
+                tripId
+        );
+
+        jdbc.update("""
+                INSERT INTO dispatch_decisions (id, incident_id, ambulance_id, hospital_id, pickup_eta_minutes,
+                                                hospital_eta_minutes, hospital_load, quality_penalty,
+                                                type_penalty, total_cost, explanation, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                decisionId,
+                trip.incidentId(),
+                trip.ambulanceId(),
+                hospitalId,
+                winningScore.pickupEtaMinutes(),
+                winningScore.hospitalEtaMinutes(),
+                winningScore.hospitalLoad(),
+                winningScore.qualityPenalty(),
+                winningScore.typePenalty(),
+                winningScore.totalCost(),
+                "Reroute: " + winningScore.explanation(),
+                Timestamp.from(now)
+        );
+
+        insertCandidateScores(decisionId, alternatives);
+
+        appendOutbox("Trip", tripId, "trip.rerouted", Map.of(
+                "tripId", tripId,
+                "incidentId", trip.incidentId(),
+                "ambulanceId", trip.ambulanceId(),
+                "fromHospitalId", trip.hospitalId(),
+                "toHospitalId", hospitalId,
+                "decisionId", decisionId,
+                "totalCost", winningScore.totalCost()
+        ), now);
+
+        return findTrip(tripId).orElseThrow();
+    }
+
+    @Override
+    @Transactional
+    public int publishPendingOutboxEvents(int limit) {
+        Instant now = Instant.now();
+        List<OutboxEvent> claimed = claimReadyOutboxEvents(limit, now, now);
+        int published = 0;
+        for (OutboxEvent event : claimed) {
+            markOutboxEventPublished(event.id(), now);
+            published += 1;
+        }
+        return published;
+    }
+
+    @Override
+    public void markOutboxEventPublished(String eventId, Instant publishedAt) {
+        jdbc.update("""
+                UPDATE outbox_events
+                SET published_at = ?,
+                    last_publish_error = NULL,
+                    next_publish_attempt_at = NULL
+                WHERE id = ? AND published_at IS NULL
+                """, Timestamp.from(publishedAt), eventId);
+    }
+
+    @Override
+    public void markOutboxEventFailed(String eventId, String failureReason) {
+        jdbc.update("""
+                UPDATE outbox_events
+                SET last_publish_error = ?
+                WHERE id = ? AND published_at IS NULL
+                """, failureReason, eventId);
+    }
+
+    @Override
+    public Notification addNotification(Notification notification) {
+        jdbc.update("""
+                INSERT INTO notifications (id, role, title, message, event_id, event_type, created_at, acknowledged_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                notification.id(),
+                notification.role().name(),
+                notification.title(),
+                notification.message(),
+                notification.eventId(),
+                notification.eventType(),
+                Timestamp.from(notification.createdAt()),
+                notification.acknowledgedAt() == null ? null : Timestamp.from(notification.acknowledgedAt())
+        );
+        return notification;
+    }
+
+    @Override
+    public Notification acknowledgeNotification(String notificationId) {
+        Instant acknowledgedAt = Instant.now();
+        int updated = jdbc.update("""
+                UPDATE notifications
+                SET acknowledged_at = ?
+                WHERE id = ?
+                """, Timestamp.from(acknowledgedAt), notificationId);
+        if (updated == 0) {
+            throw new IllegalStateException("Notification not found.");
+        }
+        return queryOptional("""
+                SELECT id, role, title, message, event_id, event_type, created_at, acknowledged_at
+                FROM notifications
+                WHERE id = ?
+                """, notificationMapper(), notificationId).orElseThrow();
+    }
+
+    @Override
+    @Transactional
+    public SimulationResult saveSimulationResult(SimulationResult result) {
+        jdbc.update("""
+                INSERT INTO simulation_runs (id, request, created_at)
+                VALUES (?, CAST(? AS jsonb), ?)
+                """,
+                result.id(),
+                toJson(result.request()),
+                Timestamp.from(result.createdAt())
+        );
+
+        for (SimulationStrategyResult strategyResult : result.strategyResults()) {
+            for (SimulationAssignment assignment : strategyResult.assignments()) {
+                jdbc.update("""
+                        INSERT INTO simulation_assignments (
+                            simulation_id, strategy, incident_id, condition, priority,
+                            incident_latitude, incident_longitude, ambulance_id, hospital_id,
+                            pickup_eta_minutes, hospital_eta_minutes, total_cost, matched, reason
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        result.id(),
+                        assignment.strategy().name(),
+                        assignment.incidentId(),
+                        assignment.condition().name(),
+                        assignment.priority().name(),
+                        assignment.incidentLocation().latitude(),
+                        assignment.incidentLocation().longitude(),
+                        assignment.ambulanceId(),
+                        assignment.hospitalId(),
+                        assignment.pickupEtaMinutes(),
+                        assignment.hospitalEtaMinutes(),
+                        assignment.totalCost(),
+                        assignment.matched(),
+                        assignment.reason()
+                );
+            }
+        }
+
+        return result;
+    }
+
+    @Override
+    public SecurityAuditEvent addSecurityAuditEvent(SecurityAuditEvent event) {
+        jdbc.update("""
+                INSERT INTO security_audit_events (
+                    id, actor_user_id, actor_role, action, resource_type, resource_id,
+                    outcome, reason, metadata, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)
+                """,
+                event.id(),
+                event.actorUserId(),
+                event.actorRole(),
+                event.action(),
+                event.resourceType(),
+                event.resourceId(),
+                event.outcome(),
+                event.reason(),
+                event.metadata(),
+                Timestamp.from(event.createdAt())
+        );
+        return event;
+    }
+
+    @Override
+    @Transactional
+    public void reset() {
+        jdbc.execute("""
+                TRUNCATE TABLE dispatch_candidate_scores, dispatch_decisions, outbox_events, notifications,
+                               simulation_assignments, simulation_runs, hospital_applications,
+                               trips, incidents, hospital_specialties, hospitals, ambulances
+                RESTART IDENTITY
+                """);
+        seedDemoData();
+    }
+
+    private Optional<Incident> lockIncident(String id) {
+        return queryOptional("""
+                SELECT id, requester_user_id, patient_name, phone, condition, priority, latitude, longitude,
+                       address_text, landmark, location_source, created_at, status
+                FROM incidents
+                WHERE id = ?
+                FOR UPDATE
+                """, incidentMapper(), id);
+    }
+
+    private Optional<Ambulance> lockAmbulance(String id) {
+        return queryOptional("""
+                SELECT id, call_sign, type, status, latitude, longitude, base_station
+                FROM ambulances
+                WHERE id = ?
+                FOR UPDATE
+                """, ambulanceMapper(), id);
+    }
+
+    private Optional<Hospital> lockHospital(String id) {
+        Map<String, Set<EmergencyCondition>> specialties = Map.of(id, hospitalSpecialties(id));
+        return queryOptional("""
+                SELECT id, name, latitude, longitude, total_beds, available_beds, quality_score
+                FROM hospitals
+                WHERE id = ?
+                FOR UPDATE
+                """, hospitalMapper(specialties), id);
+    }
+
+    private Optional<Trip> lockTrip(String id) {
+        return queryOptional("""
+                SELECT id, incident_id, ambulance_id, hospital_id, pickup_eta_minutes,
+                       hospital_eta_minutes, total_cost, created_at, status
+                FROM trips
+                WHERE id = ?
+                FOR UPDATE
+                """, tripMapper(), id);
+    }
+
+    private void insertCandidateScores(String decisionId, List<CandidateScore> alternatives) {
+        int rank = 1;
+        for (CandidateScore score : alternatives) {
+            jdbc.update("""
+                    INSERT INTO dispatch_candidate_scores (dispatch_decision_id, rank, ambulance_id, hospital_id,
+                                                           pickup_eta_minutes, hospital_eta_minutes, hospital_load,
+                                                           quality_penalty, type_penalty, total_cost, explanation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    decisionId,
+                    rank,
+                    score.ambulanceId(),
+                    score.hospitalId(),
+                    score.pickupEtaMinutes(),
+                    score.hospitalEtaMinutes(),
+                    score.hospitalLoad(),
+                    score.qualityPenalty(),
+                    score.typePenalty(),
+                    score.totalCost(),
+                    score.explanation()
+            );
+            rank += 1;
+        }
+    }
+
+    private void seedDemoData() {
+        insertAmbulance(new Ambulance("AMB-101", "Aster Alpha", AmbulanceType.ALS, AmbulanceStatus.AVAILABLE, new Location(12.9719, 77.6412), "Indiranagar"));
+        insertAmbulance(new Ambulance("AMB-102", "Pulse Bravo", AmbulanceType.BLS, AmbulanceStatus.AVAILABLE, new Location(12.9352, 77.6245), "Koramangala"));
+        insertAmbulance(new Ambulance("AMB-103", "Rescue Charlie", AmbulanceType.ICU, AmbulanceStatus.AVAILABLE, new Location(13.0118, 77.5549), "Malleshwaram"));
+        insertAmbulance(new Ambulance("AMB-104", "Rapid Delta", AmbulanceType.ALS, AmbulanceStatus.AVAILABLE, new Location(12.9141, 77.6101), "BTM Layout"));
+        insertAmbulance(new Ambulance("AMB-105", "Care Echo", AmbulanceType.BLS, AmbulanceStatus.AVAILABLE, new Location(12.9987, 77.5924), "Hebbal"));
+        insertAmbulance(new Ambulance("AMB-106", "Life Foxtrot", AmbulanceType.ALS, AmbulanceStatus.OFFLINE, new Location(12.9698, 77.7500), "Whitefield"));
+
+        insertHospital(new Hospital("HOS-201", "Narayana Cardiac Centre", new Location(12.9384, 77.6906), Set.of(EmergencyCondition.CARDIAC, EmergencyCondition.STROKE), 42, 7, 0.94));
+        insertHospital(new Hospital("HOS-202", "Manipal Emergency Hospital", new Location(12.9592, 77.6489), Set.of(EmergencyCondition.TRAUMA, EmergencyCondition.CARDIAC, EmergencyCondition.GENERAL), 65, 14, 0.9));
+        insertHospital(new Hospital("HOS-203", "Victoria Trauma Institute", new Location(12.9634, 77.5739), Set.of(EmergencyCondition.TRAUMA, EmergencyCondition.GENERAL), 58, 4, 0.86));
+        insertHospital(new Hospital("HOS-204", "Cloudnine Pediatric ER", new Location(12.9336, 77.6234), Set.of(EmergencyCondition.PEDIATRIC, EmergencyCondition.GENERAL), 35, 9, 0.89));
+        insertHospital(new Hospital("HOS-205", "Baptist North Care", new Location(13.0358, 77.5891), Set.of(EmergencyCondition.STROKE, EmergencyCondition.GENERAL), 44, 11, 0.84));
+
+        Instant now = Instant.now();
+        insertIncident(new Incident("INC-301", "patient.demo", "Ananya Rao", "+91-90000-10001", EmergencyCondition.CARDIAC, IncidentPriority.CRITICAL, new Location(12.9458, 77.6309), "Koramangala 5th Block, Bengaluru", "Near Forum signal", "SEEDED", now.minusSeconds(180), IncidentStatus.NEW));
+        insertIncident(new Incident("INC-302", "patient.demo", "Rohan Mehta", "+91-90000-10002", EmergencyCondition.TRAUMA, IncidentPriority.HIGH, new Location(12.9166, 77.6101), "BTM Layout 2nd Stage, Bengaluru", "Main road", "SEEDED", now.minusSeconds(90), IncidentStatus.NEW));
+    }
+
+    private void insertAmbulance(Ambulance ambulance) {
+        jdbc.update("""
+                INSERT INTO ambulances (id, call_sign, type, status, latitude, longitude, base_station)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ambulance.id(),
+                ambulance.callSign(),
+                ambulance.type().name(),
+                ambulance.status().name(),
+                ambulance.location().latitude(),
+                ambulance.location().longitude(),
+                ambulance.baseStation()
+        );
+    }
+
+    private void insertHospital(Hospital hospital) {
+        jdbc.update("""
+                INSERT INTO hospitals (id, name, latitude, longitude, total_beds, available_beds, quality_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                hospital.id(),
+                hospital.name(),
+                hospital.location().latitude(),
+                hospital.location().longitude(),
+                hospital.totalBeds(),
+                hospital.availableBeds(),
+                hospital.qualityScore()
+        );
+        for (EmergencyCondition specialty : hospital.specialties()) {
+            jdbc.update("""
+                    INSERT INTO hospital_specialties (hospital_id, condition)
+                    VALUES (?, ?)
+                    """, hospital.id(), specialty.name());
+        }
+    }
+
+    private void insertIncident(Incident incident) {
+        jdbc.update("""
+                INSERT INTO incidents (id, requester_user_id, patient_name, phone, condition, priority, latitude, longitude,
+                                       address_text, landmark, location_source, created_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                incident.id(),
+                incident.requesterUserId(),
+                incident.patientName(),
+                incident.phone(),
+                incident.condition().name(),
+                incident.priority().name(),
+                incident.location().latitude(),
+                incident.location().longitude(),
+                incident.addressText(),
+                incident.landmark(),
+                incident.locationSource(),
+                Timestamp.from(incident.createdAt()),
+                incident.status().name()
+        );
+    }
+
+    private void appendOutbox(String aggregateType, String aggregateId, String eventType, Map<String, ?> payload, Instant now) {
+        jdbc.update("""
+                INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload, created_at)
+                VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?)
+                """,
+                newId("EVT"),
+                aggregateType,
+                aggregateId,
+                eventType,
+                toJson(payload),
+                Timestamp.from(now)
+        );
+    }
+
+    private Map<String, Set<EmergencyCondition>> allHospitalSpecialties() {
+        return jdbc.query("""
+                SELECT hospital_id, condition
+                FROM hospital_specialties
+                ORDER BY hospital_id, condition
+                """, rs -> {
+            Map<String, Set<EmergencyCondition>> result = new LinkedHashMap<>();
+            while (rs.next()) {
+                result.computeIfAbsent(rs.getString("hospital_id"), ignored -> new LinkedHashSet<>())
+                        .add(EmergencyCondition.valueOf(rs.getString("condition")));
+            }
+            return result;
+        });
+    }
+
+    private Set<EmergencyCondition> hospitalSpecialties(String hospitalId) {
+        return new LinkedHashSet<>(jdbc.query("""
+                SELECT condition
+                FROM hospital_specialties
+                WHERE hospital_id = ?
+                ORDER BY condition
+                """,
+                (rs, rowNum) -> EmergencyCondition.valueOf(rs.getString("condition")),
+                hospitalId
+        ));
+    }
+
+    private RowMapper<Ambulance> ambulanceMapper() {
+        return (rs, rowNum) -> new Ambulance(
+                rs.getString("id"),
+                rs.getString("call_sign"),
+                AmbulanceType.valueOf(rs.getString("type")),
+                AmbulanceStatus.valueOf(rs.getString("status")),
+                new Location(rs.getDouble("latitude"), rs.getDouble("longitude")),
+                rs.getString("base_station")
+        );
+    }
+
+    private RowMapper<Hospital> hospitalMapper(Map<String, Set<EmergencyCondition>> specialties) {
+        return (rs, rowNum) -> new Hospital(
+                rs.getString("id"),
+                rs.getString("name"),
+                new Location(rs.getDouble("latitude"), rs.getDouble("longitude")),
+                specialties.getOrDefault(rs.getString("id"), Set.of()),
+                rs.getInt("total_beds"),
+                rs.getInt("available_beds"),
+                rs.getDouble("quality_score")
+        );
+    }
+
+    private RowMapper<Incident> incidentMapper() {
+        return (rs, rowNum) -> new Incident(
+                rs.getString("id"),
+                rs.getString("requester_user_id"),
+                rs.getString("patient_name"),
+                rs.getString("phone"),
+                EmergencyCondition.valueOf(rs.getString("condition")),
+                IncidentPriority.valueOf(rs.getString("priority")),
+                new Location(rs.getDouble("latitude"), rs.getDouble("longitude")),
+                rs.getString("address_text"),
+                rs.getString("landmark"),
+                rs.getString("location_source"),
+                instant(rs, "created_at"),
+                IncidentStatus.valueOf(rs.getString("status"))
+        );
+    }
+
+    private RowMapper<HospitalApplication> hospitalApplicationMapper() {
+        return (rs, rowNum) -> new HospitalApplication(
+                rs.getString("id"),
+                rs.getString("hospital_name"),
+                rs.getString("contact_name"),
+                rs.getString("contact_phone"),
+                rs.getString("address_text"),
+                new Location(rs.getDouble("latitude"), rs.getDouble("longitude")),
+                parseSpecialties(rs.getString("specialties")),
+                rs.getInt("total_beds"),
+                HospitalApplicationStatus.valueOf(rs.getString("status")),
+                instant(rs, "created_at"),
+                nullableInstant(rs, "reviewed_at")
+        );
+    }
+
+    private RowMapper<Trip> tripMapper() {
+        return (rs, rowNum) -> new Trip(
+                rs.getString("id"),
+                rs.getString("incident_id"),
+                rs.getString("ambulance_id"),
+                rs.getString("hospital_id"),
+                rs.getDouble("pickup_eta_minutes"),
+                rs.getDouble("hospital_eta_minutes"),
+                rs.getDouble("total_cost"),
+                instant(rs, "created_at"),
+                TripStatus.valueOf(rs.getString("status"))
+        );
+    }
+
+    private RowMapper<DispatchAuditRecord> dispatchAuditMapper() {
+        return (rs, rowNum) -> new DispatchAuditRecord(
+                rs.getString("id"),
+                rs.getString("incident_id"),
+                rs.getString("ambulance_id"),
+                rs.getString("hospital_id"),
+                rs.getDouble("pickup_eta_minutes"),
+                rs.getDouble("hospital_eta_minutes"),
+                rs.getDouble("hospital_load"),
+                rs.getDouble("quality_penalty"),
+                rs.getDouble("type_penalty"),
+                rs.getDouble("total_cost"),
+                rs.getString("explanation"),
+                instant(rs, "created_at")
+        );
+    }
+
+    private RowMapper<OutboxEvent> outboxEventMapper() {
+        return (rs, rowNum) -> new OutboxEvent(
+                rs.getString("id"),
+                rs.getString("aggregate_type"),
+                rs.getString("aggregate_id"),
+                rs.getString("event_type"),
+                rs.getString("payload"),
+                instant(rs, "created_at"),
+                instant(rs, "published_at"),
+                rs.getInt("publish_attempts"),
+                instant(rs, "last_publish_attempt_at"),
+                rs.getString("last_publish_error"),
+                instant(rs, "next_publish_attempt_at")
+        );
+    }
+
+    private RowMapper<Notification> notificationMapper() {
+        return (rs, rowNum) -> new Notification(
+                rs.getString("id"),
+                NotificationRole.valueOf(rs.getString("role")),
+                rs.getString("title"),
+                rs.getString("message"),
+                rs.getString("event_id"),
+                rs.getString("event_type"),
+                instant(rs, "created_at"),
+                instant(rs, "acknowledged_at")
+        );
+    }
+
+    private RowMapper<SecurityAuditEvent> securityAuditEventMapper() {
+        return (rs, rowNum) -> new SecurityAuditEvent(
+                rs.getString("id"),
+                rs.getString("actor_user_id"),
+                rs.getString("actor_role"),
+                rs.getString("action"),
+                rs.getString("resource_type"),
+                rs.getString("resource_id"),
+                rs.getString("outcome"),
+                rs.getString("reason"),
+                rs.getString("metadata"),
+                instant(rs, "created_at")
+        );
+    }
+
+    private SimulationResult simulationResult(String id, String requestJson, Instant createdAt) {
+        SimulationRequest request = fromJson(requestJson, SimulationRequest.class);
+        List<SimulationAssignment> assignments = jdbc.query("""
+                SELECT strategy, incident_id, condition, priority, incident_latitude, incident_longitude,
+                       ambulance_id, hospital_id, pickup_eta_minutes, hospital_eta_minutes,
+                       total_cost, matched, reason
+                FROM simulation_assignments
+                WHERE simulation_id = ?
+                ORDER BY id
+                """, simulationAssignmentMapper(), id);
+        Map<OptimizationStrategy, List<SimulationAssignment>> byStrategy = assignments.stream()
+                .collect(Collectors.groupingBy(SimulationAssignment::strategy, LinkedHashMap::new, Collectors.toList()));
+        double greedyCost = totalSimulationCost(byStrategy.getOrDefault(OptimizationStrategy.GREEDY_SEQUENTIAL, List.of()));
+        List<SimulationStrategyResult> strategyResults = byStrategy.entrySet().stream()
+                .map(entry -> summarize(
+                        entry.getKey(),
+                        entry.getValue(),
+                        entry.getKey() == OptimizationStrategy.GLOBAL_MIN_COST
+                                ? improvementPercent(greedyCost, totalSimulationCost(entry.getValue()))
+                                : 0
+                ))
+                .toList();
+        return new SimulationResult(id, request, createdAt, strategyResults);
+    }
+
+    private RowMapper<SimulationAssignment> simulationAssignmentMapper() {
+        return (rs, rowNum) -> new SimulationAssignment(
+                OptimizationStrategy.valueOf(rs.getString("strategy")),
+                rs.getString("incident_id"),
+                EmergencyCondition.valueOf(rs.getString("condition")),
+                IncidentPriority.valueOf(rs.getString("priority")),
+                new Location(rs.getDouble("incident_latitude"), rs.getDouble("incident_longitude")),
+                rs.getString("ambulance_id"),
+                rs.getString("hospital_id"),
+                rs.getDouble("pickup_eta_minutes"),
+                rs.getDouble("hospital_eta_minutes"),
+                rs.getDouble("total_cost"),
+                rs.getBoolean("matched"),
+                rs.getString("reason")
+        );
+    }
+
+    private double totalSimulationCost(List<SimulationAssignment> assignments) {
+        return assignments.stream()
+                .filter(SimulationAssignment::matched)
+                .mapToDouble(SimulationAssignment::totalCost)
+                .sum();
+    }
+
+    private double improvementPercent(double baselineCost, double optimizedCost) {
+        if (baselineCost <= 0) {
+            return 0;
+        }
+        return Math.max(0, ((baselineCost - optimizedCost) / baselineCost) * 100);
+    }
+
+    private SimulationStrategyResult summarize(
+            OptimizationStrategy strategy,
+            List<SimulationAssignment> assignments,
+            double improvementPercent
+    ) {
+        List<SimulationAssignment> matched = assignments.stream()
+                .filter(SimulationAssignment::matched)
+                .toList();
+        double pickupAverage = matched.stream()
+                .mapToDouble(SimulationAssignment::pickupEtaMinutes)
+                .average()
+                .orElse(0);
+        double transferAverage = matched.stream()
+                .mapToDouble(SimulationAssignment::hospitalEtaMinutes)
+                .average()
+                .orElse(0);
+        double totalCost = matched.stream()
+                .mapToDouble(SimulationAssignment::totalCost)
+                .sum();
+        return new SimulationStrategyResult(
+                strategy,
+                matched.size(),
+                assignments.size() - matched.size(),
+                round(pickupAverage),
+                round(transferAverage),
+                round(totalCost),
+                round(improvementPercent),
+                assignments
+        );
+    }
+
+    private <T> Optional<T> queryOptional(String sql, RowMapper<T> rowMapper, Object... args) {
+        List<T> rows = jdbc.query(sql, rowMapper, args);
+        if (rows.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(rows.getFirst());
+    }
+
+    private Instant instant(ResultSet rs, String column) throws SQLException {
+        OffsetDateTime value = rs.getObject(column, OffsetDateTime.class);
+        return value == null ? null : value.toInstant();
+    }
+
+    private Instant nullableInstant(ResultSet rs, String column) throws SQLException {
+        OffsetDateTime value = rs.getObject(column, OffsetDateTime.class);
+        return value == null ? null : value.toInstant();
+    }
+
+    private Set<EmergencyCondition> parseSpecialties(String rawSpecialties) {
+        if (rawSpecialties == null || rawSpecialties.isBlank()) {
+            return Set.of();
+        }
+        return List.of(rawSpecialties.split(",")).stream()
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .map(EmergencyCondition::valueOf)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    private String newId(String prefix) {
+        return prefix + "-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+    }
+
+    private <T> T fromJson(String payload, Class<T> type) {
+        try {
+            return objectMapper.readValue(payload, type);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException("Unable to deserialize JSON payload.", exception);
+        }
+    }
+
+    private String toJson(Object payload) {
+        try {
+            return objectMapper.writeValueAsString(payload);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException("Unable to serialize outbox payload.", exception);
+        }
+    }
+
+    private double round(double value) {
+        return Math.round(value * 10.0) / 10.0;
+    }
+
+    private AmbulanceType requiredAmbulanceType(EmergencyCondition condition, IncidentPriority priority) {
+        if (priority == IncidentPriority.CRITICAL) {
+            return AmbulanceType.ALS;
+        }
+        return switch (condition) {
+            case CARDIAC, STROKE -> AmbulanceType.ALS;
+            case TRAUMA -> priority == IncidentPriority.HIGH ? AmbulanceType.ALS : AmbulanceType.BLS;
+            case PEDIATRIC, GENERAL -> AmbulanceType.BLS;
+        };
+    }
+}
