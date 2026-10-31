@@ -767,6 +767,18 @@ function LoginView({
 }) {
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
 
+  const demoAccounts: { role: UserRole; label: string; username: string }[] = [
+    { role: 'CONTROL', label: 'Control dashboard', username: 'control.demo' },
+    { role: 'DRIVER', label: 'Ambulance driver', username: 'driver.demo' },
+    { role: 'HOSPITAL', label: 'Hospital', username: 'hospital.demo' },
+    { role: 'PATIENT', label: 'Patient', username: 'patient.demo' }
+  ];
+
+  function selectDemoAccount(account: (typeof demoAccounts)[number]) {
+    setMode('signin');
+    setForm({ username: account.username, password: '123', role: account.role });
+  }
+
   function useHospitalLocation() {
     if (!('geolocation' in navigator)) return;
     navigator.geolocation.getCurrentPosition((position) => {
@@ -795,7 +807,7 @@ function LoginView({
           {mode === 'signin' ? (
             <>
               <label>
-                Email
+                Email / Username
                 <input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} />
               </label>
               <label>
@@ -817,6 +829,28 @@ function LoginView({
               <button className="primary-button" type="button" onClick={onLogin} disabled={busy}>
                 Sign In
               </button>
+              <section className="demo-login-panel" aria-label="Demo login accounts">
+                <div>
+                  <p className="eyebrow">Quick access</p>
+                  <h2>Demo accounts</h2>
+                </div>
+                <div className="demo-user-grid">
+                  {demoAccounts.map((account) => (
+                    <button
+                      className="demo-user-card"
+                      key={account.role}
+                      type="button"
+                      onClick={() => selectDemoAccount(account)}
+                      disabled={busy}
+                    >
+                      <strong>{account.label}</strong>
+                      <span>{account.username}</span>
+                      <small>Use demo account →</small>
+                    </button>
+                  ))}
+                </div>
+                <p className="form-note">Demo password: <strong>123</strong>. If the backend has LIFELINE_DEMO_PASSWORD configured, use that password instead.</p>
+              </section>
             </>
           ) : (
             <>
