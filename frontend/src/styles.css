@@ -1903,3 +1903,59 @@ button {
     white-space: normal;
   }
 }
+
+
+.demo-login-panel {
+  border-top: 1px solid #e2e8f0;
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  padding-top: 16px;
+}
+
+.demo-login-panel h2 {
+  color: #172033;
+  font-size: 16px;
+  margin: 2px 0 0;
+}
+
+.demo-user-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.demo-user-card {
+  background: #f8fafc;
+  border: 1px solid #dbe4ee;
+  border-radius: 8px;
+  color: #172033;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px;
+  text-align: left;
+}
+
+.demo-user-card:hover,
+.demo-user-card:focus-visible {
+  background: #eff6ff;
+  border-color: #93c5fd;
+  outline: none;
+}
+
+.demo-user-card strong {
+  font-size: 12px;
+}
+
+.demo-user-card span {
+  color: #475569;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.demo-user-card small {
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 800;
+}
